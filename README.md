@@ -19,6 +19,7 @@ on modern SPTM+PAC+TPRO hardware.
 | [Kernel Write Primitive](kernel-write.md) | RB-tree rotation write — binary-verified, no PAC |
 | [PoC Survey](poc-survey.md) | Analysis of 4 recent iOS 26/27 PoCs + exploitation patterns |
 | [Modern PAC Bypasses](modern-pac-bypasses.md) | DarkSword, Predator, Coruna — how they worked and what we learn |
+| [Sandbox Escape](sandbox-escape.md) | worse_query containermanagerd TOCTOU — unpatched userland sandbox escape |
 
 ## The Chain
 
