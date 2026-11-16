@@ -70,25 +70,38 @@ Vulnerable code in `AVE_DLB::AssignUnitPreempt` at kext offset `0x53a6d8`:
 When `cmd->field_0x28 == 0` → underflow to 0xFFFFFFFF → massive OOB offset.
 Value at `eu_base + 8 + 32*OOB_SLOT` is an adjacent kernel heap pointer.
 
-**KASLR bypass hypothesis:** The OOB-read value flows into the HEVC parameter set
-(VPS NAL unit) construction, returning a kernel VA to userspace through the
-`VTCompressionSession` callback's `CMSampleBuffer`.
+**KASLR bypass hypothesis:** ~~The OOB-read value flows into HEVC VPS/SPS/PPS via CMSampleBuffer.~~
 
-**Status: Unconfirmed.** Prior probe used wrong NTL (16462, the safe value). Needs
-re-probe with NTL=16463 and correct encoder spec. See `ave2_sbuf_v2.py`.
+**STATUS: DEAD AS KASLR BYPASS (Nov 16, binary analysis)**
 
-**Apple's fix (iOS 26.7.2):** "Improved input validation" — adds validation of
-`cmd->field_0x28` before the slot index is used. The fix is NOT "improved bounds
-checking" (which would be after-the-fact), confirming the fix gates on input.
+Binary analysis of AssignUnitPreempt (file offset 0x150228, 26.6.1 target kext):
+- OOB-read value x8 at 0x53aa2c is used ONLY in `cmp x10, x8`
+- Immediately overwritten on BOTH branch paths:
+  - b.ge NOT taken: `ldr w8, [x9]` at 0x53aa3c overwrites x8 (32-bit count)
+  - b.ge taken: `ldr w8, [x20, #0x50]` at 0x53aa64 overwrites x8
+- Neither path stores the OOB value to any output buffer or x25 (arg6/output)
+- VPS/SPS/PPS are NOT constructed in this function
+
+The OOB value only controls a branch direction — no data flow to userspace.
+
+Apple's advisory "read kernel memory" = the kernel kext reads OOB (a defect in kernel
+code that could expose internal kernel state to the KERNEL, not to the attacker).
+
+**Code change note:** The csel-based protection already present in 26.6.1 kext prevents
+slot = 0xFFFFFFFF from reaching the read (poison path causes fault instead). The actual
+"fix" for 26.7.2 is upstream — in NTL input validation before the encode pipeline.
+
+**Probe `probe_ave2_sbuf_v2.py` (job 2aa266c9):** Expected result — no kernel pointers
+in VPS/SPS/PPS bytes. If NTL=16463 → slot=0xFFFFFFFF: device will panic instead.
 
 #### 1b: OOB Write — CVE-2026-112468/469/470 (kernel corruption)
 
 Same `AssignUnitPreempt` path, write side. After the OOB read at 0x53aa2c, the
-loaded value is used as a pointer and dereferenced for a store — triggering a kernel
-data abort at `AppleAVE2+0xDA78` when the loaded value is not a valid kernel pointer.
+loaded value is used as a pointer and dereferenced for a store. Since the OOB-read
+value itself cannot be a valid kernel pointer without a prior KASLR bypass, this path
+requires KASLR + heap shaping to suppress the panic.
 
-Exploitation requires suppressing the panic (by ensuring the OOB-read value IS a valid
-kernel pointer, achievable after KASLR defeat + heap shaping).
+**Status: SECONDARY** — depends on a KASLR bypass from another source.
 
 **Apple's fix (iOS 26.7.2):** "Improved bounds checking" for 112468/469/470 — the
 three CVEs correspond to three distinct buffer types that share the same overflow logic.
@@ -97,14 +110,11 @@ three CVEs correspond to three distinct buffer types that share the same overflo
 
 ### Stage 2: KASLR Defeat
 
-**Leading candidate: AVE2 OOB Read (Stage 1a above)**
+**CVE-2026-112466 as KASLR bypass: DEAD (Nov 16)**
 
-If the OOB read value flows into VPS/SPS/PPS metadata, a single `VTCompressionSession`
-encode with NTL=16463 returns a kernel VA in the CMSampleBuffer callback.
+Binary analysis confirmed the OOB-read value does NOT reach userspace. See Stage 1a.
 
-```
-kernel_slide = leaked_va - 0xfffffff00853a6d8   ; (unslid AssignUnitPreempt VA)
-```
+**Primary candidate: CVE-2026-65405 (host_info/proc_info uninit, STAR Labs)**
 
 **Secondary candidate: CVE-2026-65405 (host_info/proc_info uninit)**
 
