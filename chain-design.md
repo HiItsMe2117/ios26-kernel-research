@@ -1,160 +1,202 @@
 # Exploit Chain Design — iOS 26.6.1 (A18)
 
-**Last updated:** 2026-11-13  
+**Last updated:** 2026-11-16  
 **Target:** iPhone 16 Plus (iPhone17,4, D48AP), iOS 26.6.1 (23G83), A18
 
-## Architecture
+---
+
+## ⚠️ Dead Ends (as of Nov 16)
+
+| Approach | Status | Killed |
+|----------|--------|--------|
+| CVE-2026-86916 IGMP UAF | **DEAD** | Patched in 26.6.1. 21M+ multicast ops, zero anomalies. Binary confirmed: CAS-unlock removed at handler+0x0584. |
+| SysBumps KASLR (CVE-2024-54531) | **DEAD** | SPTM blocks speculative TTBR1 walk on A18. Nov 7 "result" was batch warmup artifact — interleaved A/B shows zero signal. |
+| CVE-2026-65405 OOL descriptor sp+208 | **DEAD** | 26.7.0-only code path. The vulnerable 260-byte block was introduced AND patched in 26.7.0. The 26.6.1 target never had it. |
+| CVE-2026-43743 IOGPU race | **DEAD** | UAF triggerable, but all vtable dispatch calls are PAC-signed (discriminants 0xdd4e, 0x4664, 0x43af). Post-UAF exploitation blocked. |
+| AVE2 DPB OOB write (NTL=2057) | **DEAD** | DART IOMMU raises DARTHwException at the kext boundary. Empirically confirmed with 0xAA pre-fill detection: 16 victim surfaces unchanged after NTL=2057 encode. |
+
+---
+
+## Current Architecture (Nov 16)
 
 ```
-IGMP UAF ──> Kernel Read ──> KASLR + IOKit Registry Walk + PAC Keys
-(CVE-2026-86916) (getsourcefilter)           |
-                                             v
-                                   Kernel Write (RB rotation)
-                                             |
-                                             v
-                                  ICMP6_FILTER Overwrite (32B)
-                                             |
-                                             v
-                                    Battery Value Tweak
+AVE2 AssignUnitPreempt OOB Read
+  (CVE-2026-112466)
+  NTL=16463 + {RCMode:20, EncoderUsage:1}
+       |
+       v
+  OOB ldr x8, [eu_base + 8 + 32*OOB_SLOT]
+  (CPU-side kernel read — NOT DART)
+       |
+       v [value may flow into HEVC VPS/SPS/PPS NAL units]
+  CMSampleBuffer callback → kernel VA in VPS bytes
+       |
+       v
+  KASLR slide = leaked_va - known_unslid_base    [UNCONFIRMED]
+       |
+       +─────────────────────────────────────────+
+       |                                          |
+       v                                          v
+  ICMP6_FILTER write (confirmed)        AVE2 OOB write path
+  → target: ucred uid/gid → root        (CVE-2026-112468/469/470)
+                                         → heap spray → kernel R/W
+                                         → physmap SpringBoard __DATA
+                                         → IMP overwrite → battery tweak
 ```
 
-If PAC key extraction + cipher reversal succeeds, the chain upgrades:
-
-```
-                                    PAC Key Extraction
-                                   (rop_pid → B-keys)
-                                             |
-                                             v
-                                    Forge signed pointers
-                                             |
-                                             v
-                                   Full post-exploitation
-```
+---
 
 ## Stage-by-Stage
 
-### Stage 1: IGMP UAF Trigger — 40% confidence
+### Stage 1: AVE2 OOB — CVE-2026-112466 / 112468–470
 
-**CVE-2026-86916** — the critical-path blocker for the entire chain.
+**Primary path.** Two distinct AVE2 primitives, both unpatched on 26.6.1 (patched in iOS 26.7.2).
 
-The bug: `ip_msource` nodes in the multicast source filter RB-tree can be freed while
-references still exist. The deferred release queue (`flush_relq`) races with membership
-operations.
+#### 1a: OOB Read — CVE-2026-112466 (KASLR bypass candidate)
 
-**What we've tried:**
-- 7 probe versions on device. None triggered the race.
-- v1-v4: Direct leave/join racing — too fast, no release queue population
-- v5-v6: Timer-based, closer but never hit the window
-- v7: Rapid group cycling with reader thread — detected stale data once but not reproducible
+Trigger: HEVC 1280×720 VTCompressionSession with:
+- `encoderSpec = {RCMode: 20, EncoderUsage: 1}`
+- `NumberOfTemporalLayers = 16463`
 
-**Probe v8 design (not yet tested):**
-1. Join 100 multicast groups on individual sockets (ff02::dead:1 through ff02::dead:64)
-2. Close all 100 sockets → each enters MLD_LEAVING_MEMBER state
-3. Wait 500ms for timer tick
-4. Mac on same link sends MLDv1 General Query
-5. `mld_v2_cancel_link_timers()` fires → mass enqueue to deferred release queue
-6. Race: new joins + setsockopt hammer + getsourcefilter reader simultaneously
-7. Detection: Z_ZERO patterns, invalid sockaddr, kernel pointers in source list
-
-Key insight from v7 failure: the release queue must be populated via the **MLD state
-machine** (not just socket close), requiring a Mac on the same link to inject MLD queries.
-
-### Stage 2: Kernel Read — 90% confidence (PROVEN)
-
-**`getsourcefilter()` is proven on device.**
-
-Tested Nov 7: joined 200 IPv4 multicast sources, all 200 read back via
-`getsockopt(IP_MSFILTER)`. Each source entry is 128 bytes (`sockaddr_storage`).
-
-After UAF reclamation, the RB-tree nodes contain kernel heap pointers instead of
-source addresses. `getsourcefilter` copies them to userspace — free kernel read.
-
-```c
-int getsourcefilter(int fd, uint32_t ifindex, struct sockaddr *group,
-                    socklen_t grouplen, uint32_t *fmode, uint32_t *numsrc,
-                    struct sockaddr_storage *slist);
+Vulnerable code in `AVE_DLB::AssignUnitPreempt` at kext offset `0x53a6d8`:
+```asm
+0x53aa0c: ldr w11, [x20, #0x28]         ; slot = cmd->field_0x28  ← UNVALIDATED
+0x53aa14: orr x11, x12, x11, lsl #5     ; x11 = 8 | (slot<<5)
+0x53aa20: add x16, x8, x11              ; eu_base + 8 + 32*slot
+0x53aa2c: ldr x8, [x12]                 ; ← OOB READ at eu_base + 8 + 32*OOB_SLOT
+0x53aa30: cmp x10, x8                   ; bounds check is AFTER the read
 ```
 
-- `ifindex` = 22 (en0 on our device)
-- Returns 128 bytes per source entry
-- 200 entries = 25.6KB per read operation
-- Works from app sandbox
+When `cmd->field_0x28 == 0` → underflow to 0xFFFFFFFF → massive OOB offset.
+Value at `eu_base + 8 + 32*OOB_SLOT` is an adjacent kernel heap pointer.
 
-### Stage 3: KASLR Defeat — FREE (from read primitive)
+**KASLR bypass hypothesis:** The OOB-read value flows into the HEVC parameter set
+(VPS NAL unit) construction, returning a kernel VA to userspace through the
+`VTCompressionSession` callback's `CMSampleBuffer`.
 
-Previously a separate stage (SysBumps timing side-channel). SysBumps turned out to be dead
-on A18 in practice (CVE-2024-54531 has a ~20 tick gap but 100% noise on device;
-CVE-2026-65405 is a single instruction fix).
+**Status: Unconfirmed.** Prior probe used wrong NTL (16462, the safe value). Needs
+re-probe with NTL=16463 and correct encoder spec. See `ave2_sbuf_v2.py`.
 
-Now KASLR is free: any kernel pointer leaked through the read primitive gives the slide.
-Kernel pointers in reclaimed RB-tree nodes start with `0xfffffff0` — subtract the known
-unslid base to get the slide.
+**Apple's fix (iOS 26.7.2):** "Improved input validation" — adds validation of
+`cmd->field_0x28` before the slot index is used. The fix is NOT "improved bounds
+checking" (which would be after-the-fact), confirming the fix gates on input.
 
-### Stage 4: Kernel Write — 75% confidence (BINARY-VERIFIED)
+#### 1b: OOB Write — CVE-2026-112468/469/470 (kernel corruption)
 
-**RB-tree rotation write primitive.** Disassembled `ip_msource_tree` `RB_REMOVE` at
-`0xfffffff00aa314f0`. No PAC on any tree pointer — confirmed plain `LDR`/`STR`.
+Same `AssignUnitPreempt` path, write side. After the OOB read at 0x53aa2c, the
+loaded value is used as a pointer and dereferenced for a store — triggering a kernel
+data abort at `AppleAVE2+0xDA78` when the loaded value is not a valid kernel pointer.
 
-During tree rotation (rebalancing after node removal):
+Exploitation requires suppressing the panic (by ensuring the OOB-read value IS a valid
+kernel pointer, achievable after KASLR defeat + heap shaping).
 
-```
-WRITE:  *(old->rbe_parent + {0 or 8}) = succ
-```
+**Apple's fix (iOS 26.7.2):** "Improved bounds checking" for 112468/469/470 — the
+three CVEs correspond to three distinct buffer types that share the same overflow logic.
 
-- **WHERE** = controlled by corrupting `rbe_parent` in a reclaimed node
-- **VALUE** = `succ` (a kernel heap pointer, leakable via the read primitive)
+---
 
-Combined with **ICMP6_FILTER**: `setsockopt(ICMP6_FILTER)` writes exactly 32 bytes of
-controlled data to `*in6p_icmp6filt`. By redirecting `in6p_icmp6filt` via the RB rotation
-write, we get arbitrary 32-byte writes.
+### Stage 2: KASLR Defeat
 
-The `ip_msource` struct is ~40 bytes → `kalloc.48` bucket. RB_ENTRY at offset 0:
-```
-+0x00: rbe_left    (8 bytes)
-+0x08: rbe_right   (8 bytes)
-+0x10: rbe_parent  (8 bytes, LSB = color bit)
-+0x18: ims_haddr   (4 bytes, sort key)
-```
+**Leading candidate: AVE2 OOB Read (Stage 1a above)**
 
-### Stage 5: Post-Exploitation — Battery tweak viable
-
-See [post-exploitation.md](post-exploitation.md) for the full dead-ends analysis.
-
-The viable path: **PAC-preserving ICMP6_FILTER overwrite** of an OSNumber in the IOKit
-registry:
+If the OOB read value flows into VPS/SPS/PPS metadata, a single `VTCompressionSession`
+encode with NTL=16463 returns a kernel VA in the CMSampleBuffer callback.
 
 ```
-Step 1: Kernel read → traverse IOKit registry → find OSNumber for CurrentCapacity
-Step 2: Read OSNumber's 32 bytes (PAC-signed vtable | metadata | value | size)
-Step 3: RB rotation → redirect in6p_icmp6filt to OSNumber address
-Step 4: setsockopt(ICMP6_FILTER) with:
-        [original_vtable_signed | original_metadata | 100 | original_size]
-Step 5: OSNumber.value = 100 → battery reads as 100%
+kernel_slide = leaked_va - 0xfffffff00853a6d8   ; (unslid AssignUnitPreempt VA)
 ```
 
-PAC-signed vtable bytes are preserved because they're written back to the **same address**
-they were read from. The DA key context includes the storage address, so the signature
-remains valid.
+**Secondary candidate: CVE-2026-65405 (host_info/proc_info uninit)**
 
-## IOKit Registry Traversal Offsets (RESOLVED)
+Reporter: Billy Jheng Bing Jhong + Pan Zhenpeng (@Peterpan0927), STAR Labs SG.
+Fixed in iOS 26.7, confirmed unpatched on 26.6.1.
+"An app may be able to determine kernel memory layout" — CWE-457 uninitialized variable.
 
-From kernelcache analysis (587+ code sites cross-referenced):
+Prior sweep of host_info (flavors 1–25), host_statistics64 (flavors 1–15), proc_info
+(callnum=2 all flavors) found only `0xffffffff00000000` (routing/netmask sentinels, NOT
+kernel text addresses). The `host_statistics` section returned empty — all flavors may
+have errored. Needs targeted re-probe against specific struct padding fields.
+
+See [kaslr-bypass-research.md](kaslr-bypass-research.md) for full history.
+
+---
+
+### Stage 3: Kernel Write — CONFIRMED
+
+**ICMP6_FILTER write primitive.**
+
+`setsockopt(IPPROTO_ICMPV6, ICMP6_FILTER, 32B)` writes exactly 32 bytes to
+`*in6p_icmp6filt`. The kernel copies 32 bytes of attacker-controlled data to the address
+stored in `in6p_icmp6filt`.
+
+- **Target field:** `in6p_icmp6filt` in `struct in6pcb`
+- **Write size:** exactly 32 bytes
+- **PAC status:** no PAC on the write path — confirmed binary
+- **Sandbox:** reachable from app sandbox (DGRAM IPPROTO_ICMPV6 socket works)
+- **Confirmed on device:** Nov 15, `probe_icmp6_write.py`
+
+**Without KASLR:** cannot aim this at a useful target.  
+**With KASLR:** redirect `in6p_icmp6filt` → `ucred` uid/gid fields (root) or any 32-byte
+target within reach.
+
+**Alternative write path (requires AVE2 OOB write working):**
+
+AVE2 OOB write (Stage 1b) → heap spray adjacent `kalloc.512` objects → control OOB-write
+destination → arbitrary kernel memory write → physmap → SpringBoard `__DATA` IMP overwrite.
+
+---
+
+### Stage 4: Post-Exploitation — Battery Icon Tweak
+
+**Injection target: SpringBoard**, not backboardd. The status bar battery icon is rendered
+in SpringBoard by `_UIStatusBarBatteryView` (UIKit) and `STUIStatusBarBatteryItem`
+(SpringBoardDisplay.framework, iOS 26 Liquid Glass).
+
+**Hook targets:**
+```objc
+-[_UIStatusBarBatteryView _batteryFillColor]      // change fill color
+-[_UIStatusBarBatteryView setChargePercent:]       // intercept percentage
+-[STUIStatusBarBatteryItem applyUpdate:toDisplayItem:]  // full data pipeline
+```
+
+**Mechanism (data-only, SPTM-safe):**
+
+SPTM (EL2) blocks kernel→text page-type transitions. But SpringBoard's `__DATA` segment
+is `XNU_DEFAULT` (writable from EL1 via physmap). ObjC IMPs are stored as function
+POINTERS in `__DATA` — overwriting them does not create new executable pages.
 
 ```
-IORegistryEntry + 0x18 → fPropertyTable (OSDictionary*)
-OSDictionary + 0x0C    → count
-OSDictionary + 0x20    → dictEntry*
-dictEntry + 0x00       → key (OSSymbol*)
-dictEntry + 0x08       → value (OSObject*), stride = 16 bytes
-OSSymbol + 0x10        → char* string
-OSNumber + 0x10        → uint64_t value (THE TARGET)
+1. KASLR defeat → compute SpringBoard's __DATA VA
+2. AVE2 OOB write (or ICMP6_FILTER) → kernel R/W primitive
+3. physmap: VA → PA → write ObjC IMP pointer for _batteryFillColor
+4. IMP → ROP/JOP gadget in existing SpringBoard/UIKit text → custom payload
 ```
 
-## Confidence Table
+**Direct ICMP6_FILTER path (simpler):**
 
-| Goal | Confidence | Blocker |
-|------|-----------|---------|
-| Kernel R/W | 40% | IGMP UAF trigger |
-| Battery tweak | 40% | UAF + IPC struct offsets |
-| PAC key extraction | 40% (gated on UAF) | Thread traversal + cipher test |
-| Full jailbreak | 15% | PAC bypass + sandbox path |
+With KASLR + `in6p_icmp6filt` redirect:
+```
+1. Find ucred for ResearchHost/SpringBoard process
+2. ICMP6_FILTER 32B write → overwrite uid/gid = 0 (root)
+3. Use root to load tweak via launchd or dylib injection
+```
+
+---
+
+## Status Summary (Nov 16)
+
+| Component | Status |
+|-----------|--------|
+| AVE2 OOB trigger (NTL=16463) | Probe submitted — awaiting results |
+| AVE2 OOB → KASLR via VPS/SPS/PPS | **Unconfirmed** — leading candidate |
+| ICMP6_FILTER write primitive | **Confirmed** on device |
+| getsourcefilter read ops | Confirmed API, but needs UAF to corrupt tree |
+| KASLR bypass | **Blocked** — no confirmed bypass yet |
+| Sandbox escape (worse_query) | Confirmed — orthogonal to kernel chain |
+
+## Device
+
+- iPhone 16 Plus (iPhone17,4, D48AP)
+- iOS 26.6.1 (23G83)
+- A18 (SPTM + TXM + PAC)
+- Kernelcache: `__TEXT_EXEC` at VA `0xfffffff008284000`, fileoff `0x01280000`

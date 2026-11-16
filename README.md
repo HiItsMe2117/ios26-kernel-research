@@ -21,22 +21,39 @@ on modern SPTM+PAC+TPRO hardware.
 | [Modern PAC Bypasses](modern-pac-bypasses.md) | DarkSword, Predator, Coruna — how they worked and what we learn |
 | [Sandbox Escape](sandbox-escape.md) | worse_query containermanagerd TOCTOU — unpatched userland sandbox escape |
 
-## The Chain
+## The Chain (Nov 16 — updated)
 
 ```
-IGMP UAF ──> Kernel Read ──> KASLR + Registry Walk + PAC Keys
-  (CVE-2026-86916)  (getsourcefilter)          |
-                                               v
-                                     Kernel Write (RB rotation)
-                                               |
-                                               v
-                                    ICMP6_FILTER Overwrite
-                                               |
-                                               v
-                                      Battery Value Tweak
+AVE2 AssignUnitPreempt OOB Read    ← KASLR bypass (unconfirmed, probe running)
+  (CVE-2026-112466, NTL=16463)
+       |
+       v
+  Kernel VA in HEVC VPS/SPS/PPS
+  → KASLR slide
+       |
+       +─────────────────────────────+
+       |                              |
+       v                              v
+  ICMP6_FILTER write (confirmed)   AVE2 OOB write (CVE-2026-112468–470)
+  → ucred uid=0 → root              → heap spray → kernel R/W
+                                     → physmap SpringBoard __DATA
+                                     → IMP overwrite → battery tweak
 ```
+
+**Dead ends:** IGMP UAF (CVE-2026-86916) — patched in 26.6.1. SysBumps KASLR — SPTM
+blocks on A18. OOL descriptor leak (CVE-2026-65405 OOL) — 26.7.0-only code path.
+IOGPU race (CVE-2026-43743) — PAC blocks post-UAF. AVE2 DPB write — DART blocks.
+
+See [kaslr-bypass-research.md](kaslr-bypass-research.md) for the full KASLR history.
 
 ## Key Findings
+
+### ICMP6_FILTER Write Primitive — Confirmed (Nov 15)
+
+`setsockopt(IPPROTO_ICMPV6, ICMP6_FILTER, 32B)` writes exactly 32 bytes of controlled
+data to `*in6p_icmp6filt`. Fully reachable from app sandbox (DGRAM IPPROTO_ICMPV6 socket).
+No PAC on the write path. Without KASLR, can't aim it; with KASLR, targets ucred uid/gid
+or any 32-byte kernel object.
 
 ### PAC Key Derivation is Trivially Simple (Nov 13)
 
@@ -78,11 +95,19 @@ The only viable path is **PAC-preserving data modification** via ICMP6_FILTER �
 - A18 (SPTM + TXM + PAC)
 - Kernelcache: `__TEXT_EXEC` at VA `0xfffffff00827c000`, file offset `0x01278000`, size `0x02c68000`
 
-## Status
+## Status (Nov 16)
 
-The entire chain is gated on the IGMP UAF trigger (CVE-2026-86916). Read and write primitives
-are designed and the read is device-proven, but neither works without the UAF providing controlled
-heap state. See [Chain Design](chain-design.md) for full status.
+| Component | Status |
+|-----------|--------|
+| KASLR bypass | **Blocked** — AVE2 OOB read probe submitted, results pending |
+| ICMP6_FILTER write | **Confirmed** on device (needs KASLR to aim) |
+| getsourcefilter read | Confirmed API, needs UAF to corrupt tree (UAF dead) |
+| Sandbox escape (worse_query) | Confirmed — orthogonal to kernel chain |
+| IGMP UAF (CVE-2026-86916) | **DEAD** — patched in 26.6.1 |
+| SysBumps KASLR | **DEAD** — SPTM blocks on A18 |
+
+The chain is gated on KASLR. See [Chain Design](chain-design.md) and
+[KASLR Bypass Research](kaslr-bypass-research.md) for full status.
 
 ## References
 
