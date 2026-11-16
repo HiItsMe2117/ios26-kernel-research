@@ -1,7 +1,7 @@
 # KASLR Bypass Research — iOS 26.6.1 (A18)
 
-**Last updated:** 2026-11-16  
-**Current status: No confirmed bypass. AVE2 OOB read is the leading candidate.**
+**Last updated:** 2026-11-16 (binary analysis complete)  
+**Current status: AVE2 OOB read as KASLR confirmed DEAD (comparand-only). Host_stats uninit probe pending.**
 
 ---
 
@@ -12,7 +12,8 @@
 | SysBumps TLB side-channel | CVE-2024-54531 | **DEAD** | SPTM blocks speculative TTBR1 walk on A18 |
 | OOL descriptor stale sp+208 | "CVE-2026-65405" (mislabeled) | **DEAD** | 26.7.0-only code path, never in 26.6.1 |
 | host_info/proc_info uninit residue | CVE-2026-65405 (real) | **Needs re-probe** | Probe incomplete — host_statistics section empty |
-| AVE2 OOB read → VPS/SPS/PPS | CVE-2026-112466 | **Leading candidate** | Unconfirmed — wrong NTL used in prior probe |
+| AVE2 OOB read → VPS/SPS/PPS | CVE-2026-112466 | **DEAD** | Binary confirmed: OOB x8 is comparand-only, never stored |
+| host_statistics64 uninit | CVE-2026-65405 (STAR Labs) | **Probe pending** | Re-probe with correct constants (job 95e4946f) |
 
 ---
 
@@ -93,52 +94,93 @@ memory layout." CWE-457: uninitialized variable.
 
 ---
 
-## AVE2 OOB Read → VPS/SPS/PPS — Leading Candidate
+## AVE2 OOB Read → VPS/SPS/PPS — DEAD (killed Nov 16, binary analysis)
 
 **CVE-2026-112466.** Hcamael + 章鱼哥@aipy. OOB read in `AVEVideoEncoder`.
 Apple impact: "Terminate OR **read kernel memory**". Fix: "Improved input validation".
-Patched in iOS 26.7.2. **Unpatched on 26.6.1.**
+Patched in iOS 26.7.2. **Bug is live on 26.6.1 — but NOT usable as KASLR.**
 
-**The primitive:**
+### Root cause (confirmed by Capstone disassembly, 2026-11-16)
 
-In `AVE_DLB::AssignUnitPreempt` (kext offset `0x53a6d8`):
+**Bug setter** — in func39 at file offset `0x14540`:
 ```asm
-0x53aa0c: ldr w11, [x20, #0x28]         ; slot = cmd->field_0x28  ← UNVALIDATED
-0x53aa14: orr x11, x12, x11, lsl #5     ; x11 = 8 | (slot<<5)
-0x53aa20: add x16, x8, x11              ; eu_base + 8 + 32*slot
-0x53aa2c: ldr x8, [x12]                 ; ← CPU-side OOB READ (NOT DART)
-0x53aa30: cmp x10, x8                   ; bounds check AFTER the read
+sub w8, w0, #1          ; w8 = NTL - 1
+str w8, [x1, #0x28]     ; cmd->field_0x28 = NTL-1  ← NO BOUNDS CHECK
+```
+For NTL=16463: slot=16462=0x3FEE. Slot arithmetic gives OOB offset=0x7FDC8 (~492KB past slot table).
+
+**Bug read site** — in `AVE_DLB::AssignUnitPreempt` (file `0x15057c`, VA `0xfffffff00853aa2c`):
+```asm
+func+0x31c:  ldr w11, [x20, #0x28]    ; w11 = cmd->field_0x28  UNVALIDATED SLOT
+func+0x324:  orr x11, x12, x11, lsl #5
+func+0x328:  cmp x11, w11, sxtw       ; only checks bit-31 overflow (passes for slot=16462)
+func+0x33c:  ldr x8, [x12]            ; ← OOB READ: x8 = *(slot_table_base + 0x7FDC8)
+func+0x340:  cmp x10, x8              ; ← COMPARAND ONLY
 ```
 
-This is a **CPU-side kernel read** — the kernel kext reads adjacent memory, not the
-AVE2 firmware DMA. DART IOMMU is irrelevant here (that only protects firmware DMA).
+### Why this cannot leak a kernel pointer
 
-**Why it's different from the DPB path (CVE-2026-112468–470, now dead):**
-- DPB overflow: 32-bit integer wraps in firmware → firmware DMA writes OOB → DART blocks
-- AssignUnitPreempt OOB: unvalidated `cmd->field_0x28` → CPU-side kernel `ldr` → no DART
+The 64-bit OOB-read value (a kernel heap pointer from adjacent EU table memory) is:
+1. Loaded into x8
+2. Used ONLY as comparand: `cmp x10, x8` (x10 = legitimate slot count)
+3. **Never stored** to any output buffer or cmd struct field
 
-**KASLR hypothesis:**
-When the OOB-read value at `eu_base + 8 + 32*OOB_SLOT` is an adjacent kernel heap pointer,
-that value flows into HEVC parameter set (VPS NAL unit) construction. The VPS bytes return
-to userspace in the `VTCompressionSession` encode callback's `CMSampleBuffer` →
-`CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fmt, 0 /*VPS*/, ...)`.
+Since a kernel VA like `0xfffffff0...` is always > any 32-bit count x10, the fall-through
+path always runs. Fall-through stores `x9[0]` (a 32-bit temporal layer count from the
+**legitimate** slot table object, not from OOB memory) to `cmd->field_0x50`.
 
-Scan returned VPS bytes for 8-byte sequences with `0xfffffff0` prefix = kernel text pointer.
+The HEVC VPS/SPS/PPS bytes contain 32-bit temporal layer metadata — not kernel addresses.
+Probe `probe_ave2_sbuf_v2.py` (job 88942b35) is running to confirm empirically.
 
-**Trigger conditions (from exploit_chain_design.md):**
-- Codec: HEVC (`hvc1`)
-- Resolution: 1280×720
-- `encoderSpec = {RCMode: 20, EncoderUsage: 1}` passed to `VTCompressionSessionCreate`
-- `NumberOfTemporalLayers = 16463` (NOT 16462 — that's the safe boundary)
-- 2+ frames required (frame 0 is in-bounds, frame 1 triggers OOB)
+### Fix location
 
-**Prior probe failure:**
-`ave2_sbuf_leak.py` used NTL=16462 (safe). No OOB triggered. Frames were dropped
-(`kVTEncodeInfo_FrameWasDropped`, info=0x1) before reaching hardware. The
-`encoderSpec` dict was also missing (`None` passed).
+AssignUnitPreempt is **logically identical** in 26.7.2 (3987 instructions, only
+ADRP/BL address operands differ). The NTL-setter (`str w8, [x1, #0x28]`) also unchanged.
+One upstream caller found in both versions; structurally identical. Fix is likely in XNU
+IOUserClient dispatch layer or VideoToolbox.framework userspace (not in AVE2 kext).
 
-**Current status:** Fixed probe (`probe_ave2_sbuf_v2.py`) submitted to device Nov 16.
-Results pending.
+### What the OOB IS useful for
+
+The double-dereference pattern at func+0x44c:
+```asm
+func+0x44c:  ldr x8, [x10]    ; *OOB_ptr (64-bit kernel heap pointer)
+func+0x450:  ldr w8, [x8]     ; *x8 (32-bit dereference of that pointer)
+func+0x460:  str w8, [x25]    ; stored to output field (arg6)
+```
+If the OOB slot points to controlled kernel heap (requires prior heap spray → requires KASLR),
+this could achieve an **arbitrary 32-bit read** of kernel memory. This is the basis for
+CVE-2026-112468/469/470, but all require KASLR first.
+
+---
+
+## host_statistics64 Uninit — Probe Pending
+
+**Real CVE-2026-65405.** Reporter: Billy Jheng Bing Jhong + Pan Zhenpeng (@Peterpan0927),
+STAR Labs SG. Fixed in iOS 26.7 (Sep 14 2026). "An app may be able to determine kernel
+memory layout." CWE-457: uninitialized variable.
+
+**What we know:**
+- Apple describes this as returning kernel pointer residue from an uninitialized struct field
+- The API is likely host_statistics64 or task_info (from STAR Labs attribution pattern)
+- The fix is "improved memory handling" in a kernel struct initialization
+- Confirmed unpatched on 26.6.1 by Apple's advisory
+
+**What we probed (probe: `kaslr_targeted.py`, Nov ~9):**
+- `host_statistics` section in log: **completely empty** — all flavors failed silently
+- Root cause: probe used wrong constants (integers 1-10 instead of Mach constants)
+- `proc_info` hits at `0xffffffff00000000` — routing/CIDR sentinels, false positives
+
+**Re-probe (`probe_host_stats_uninit.py`, job 95e4946f):**
+- Uses correct Mach constants: `HOST_VM_INFO64=4`, `HOST_EXTMOD_INFO64=5`, etc.
+- Pre-fills buffers with `0xCC` to detect partial initialization
+- Covers `host_statistics64`, `host_info`, `task_info`, `mach_zone_info`, sysctl variants
+- Submitted 2026-11-16, device suspended — results pending
+
+**Additional probe (`probe_kaslr_v3.py`, job 28558ac5):**
+- `mach_port_kobject` — may return kernel VA of port object directly
+- `getsockopt` struct padding — uninit bytes in large structs
+- Network stats sysctl sweep
+- Submitted 2026-11-16, queued
 
 ---
 

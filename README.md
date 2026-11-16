@@ -24,25 +24,24 @@ on modern SPTM+PAC+TPRO hardware.
 ## The Chain (Nov 16 — updated)
 
 ```
-AVE2 AssignUnitPreempt OOB Read    ← KASLR bypass (unconfirmed, probe running)
-  (CVE-2026-112466, NTL=16463)
+host_statistics64 uninit leak?      ← KASLR bypass (probe pending — device suspended)
+  (CVE-2026-65405 STAR Labs, job 95e4946f)
+  OR
+mach_port_kobject direct VA?        ← KASLR v3 probe (job 28558ac5)
        |
        v
-  Kernel VA in HEVC VPS/SPS/PPS
-  → KASLR slide
+  KASLR slide computed
        |
-       +─────────────────────────────+
-       |                              |
-       v                              v
-  ICMP6_FILTER write (confirmed)   AVE2 OOB write (CVE-2026-112468–470)
-  → ucred uid=0 → root              → heap spray → kernel R/W
-                                     → physmap SpringBoard __DATA
-                                     → IMP overwrite → battery tweak
+  ICMP6_FILTER write (confirmed)
+  → ucred uid=0 → root
 ```
 
-**Dead ends:** IGMP UAF (CVE-2026-86916) — patched in 26.6.1. SysBumps KASLR — SPTM
-blocks on A18. OOL descriptor leak (CVE-2026-65405 OOL) — 26.7.0-only code path.
-IOGPU race (CVE-2026-43743) — PAC blocks post-UAF. AVE2 DPB write — DART blocks.
+**Dead ends (KASLR):** SysBumps — SPTM blocks A18. OOL descriptor — 26.7.0-only.
+AVE2 OOB read (CVE-2026-112466) — **binary confirmed DEAD**: OOB x8 value is comparand-only,
+never stored; VPS/SPS/PPS carry 32-bit temporal layer counts, not kernel VAs.
+
+**Dead ends (primitives):** IGMP UAF (CVE-2026-86916) — patched 26.6.1. IOGPU race
+(CVE-2026-43743) — PAC blocks. AVE2 DPB write — DART blocks.
 
 See [kaslr-bypass-research.md](kaslr-bypass-research.md) for the full KASLR history.
 
@@ -99,7 +98,7 @@ The only viable path is **PAC-preserving data modification** via ICMP6_FILTER �
 
 | Component | Status |
 |-----------|--------|
-| KASLR bypass | **Blocked** — AVE2 OOB read probe submitted, results pending |
+| KASLR bypass | **Blocked** — AVE2 OOB dead (binary analysis); host_stats uninit probe pending |
 | ICMP6_FILTER write | **Confirmed** on device (needs KASLR to aim) |
 | getsourcefilter read | Confirmed API, needs UAF to corrupt tree (UAF dead) |
 | Sandbox escape (worse_query) | Confirmed — orthogonal to kernel chain |
